@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from collections import deque
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots  # 添加这行
 import re
 import json
 
@@ -215,13 +216,16 @@ class HedgeMatchingEngine:
                 # 格式化平仓路径
                 close_path_str = ""
                 if close_events:
-                    sorted_events = sorted(close_events, key=lambda x: x['Date'] if pd.notna(x['Date']) else pd.Timestamp.min)
-                    details = []
-                    for e in sorted_events:
-                        d_str = e['Date'].strftime('%Y-%m-%d') if pd.notna(e['Date']) else 'N/A'
-                        p_str = f"@{e['Price']}" if pd.notna(e['Price']) else ""
-                        details.append(f"[{d_str} Tkt#{e['Ref']} Vol:{e['Vol']:.0f} {p_str}]")
-                    close_path_str = " -> ".join(details)
+                    try:
+                        sorted_events = sorted(close_events, key=lambda x: x['Date'] if pd.notna(x['Date']) else pd.Timestamp.min)
+                        details = []
+                        for e in sorted_events:
+                            d_str = e['Date'].strftime('%Y-%m-%d') if pd.notna(e['Date']) else 'N/A'
+                            p_str = f"@{e['Price']}" if pd.notna(e['Price']) else ""
+                            details.append(f"[{d_str} Tkt#{e['Ref']} Vol:{e['Vol']:.0f} {p_str}]")
+                        close_path_str = " -> ".join(details)
+                    except:
+                        close_path_str = str(close_events)
                 
                 # 计算分配比例
                 ratio = abs(alloc_amt) / abs(curr_total_vol) if abs(curr_total_vol) > 0 else 0
@@ -358,39 +362,55 @@ class HedgeAnalysis:
         if self.df_relations.empty:
             return
         
-        # 匹配统计
-        total_matched = abs(self.df_relations['Allocated_Vol']).sum()
-        total_physical = abs(self.df_physical['Volume']).sum() if 'Volume' in self.df_physical.columns else 0
-        match_rate = (total_matched / total_physical * 100) if total_physical > 0 else 0
-        
-        # 财务统计
-        total_pl = self.df_relations['Alloc_Total_PL'].sum()
-        total_unrealized = self.df_relations['Alloc_Unrealized_MTM'].sum()
-        
-        # 数量统计
-        matched_cargos = self.df_relations['Cargo_ID'].nunique()
-        total_cargos = self.df_physical['Cargo_ID'].nunique() if 'Cargo_ID' in self.df_physical.columns else 0
-        total_tickets = len(self.df_relations)
-        
-        # 时间统计
-        if 'Time_Lag' in self.df_relations.columns:
-            avg_time_lag = self.df_relations['Time_Lag'].abs().mean()
-            std_time_lag = self.df_relations['Time_Lag'].abs().std()
-        else:
-            avg_time_lag = std_time_lag = 0
-        
-        self.summary_stats = {
-            'total_matched': total_matched,
-            'total_physical': total_physical,
-            'match_rate': match_rate,
-            'total_pl': total_pl,
-            'total_unrealized': total_unrealized,
-            'matched_cargos': matched_cargos,
-            'total_cargos': total_cargos,
-            'total_tickets': total_tickets,
-            'avg_time_lag': avg_time_lag,
-            'std_time_lag': std_time_lag
-        }
+        try:
+            # 匹配统计
+            total_matched = abs(self.df_relations['Allocated_Vol']).sum() if 'Allocated_Vol' in self.df_relations.columns else 0
+            total_physical = abs(self.df_physical['Volume']).sum() if 'Volume' in self.df_physical.columns else 0
+            match_rate = (total_matched / total_physical * 100) if total_physical > 0 else 0
+            
+            # 财务统计
+            total_pl = self.df_relations['Alloc_Total_PL'].sum() if 'Alloc_Total_PL' in self.df_relations.columns else 0
+            total_unrealized = self.df_relations['Alloc_Unrealized_MTM'].sum() if 'Alloc_Unrealized_MTM' in self.df_relations.columns else 0
+            
+            # 数量统计
+            matched_cargos = self.df_relations['Cargo_ID'].nunique() if 'Cargo_ID' in self.df_relations.columns else 0
+            total_cargos = self.df_physical['Cargo_ID'].nunique() if 'Cargo_ID' in self.df_physical.columns else 0
+            total_tickets = len(self.df_relations)
+            
+            # 时间统计
+            if 'Time_Lag' in self.df_relations.columns:
+                time_lag_abs = self.df_relations['Time_Lag'].abs()
+                avg_time_lag = time_lag_abs.mean() if not time_lag_abs.isna().all() else 0
+                std_time_lag = time_lag_abs.std() if not time_lag_abs.isna().all() else 0
+            else:
+                avg_time_lag = std_time_lag = 0
+            
+            self.summary_stats = {
+                'total_matched': total_matched,
+                'total_physical': total_physical,
+                'match_rate': match_rate,
+                'total_pl': total_pl,
+                'total_unrealized': total_unrealized,
+                'matched_cargos': matched_cargos,
+                'total_cargos': total_cargos,
+                'total_tickets': total_tickets,
+                'avg_time_lag': avg_time_lag,
+                'std_time_lag': std_time_lag
+            }
+        except Exception as e:
+            st.warning(f"计算汇总统计时出错: {e}")
+            self.summary_stats = {
+                'total_matched': 0,
+                'total_physical': 0,
+                'match_rate': 0,
+                'total_pl': 0,
+                'total_unrealized': 0,
+                'matched_cargos': 0,
+                'total_cargos': 0,
+                'total_tickets': 0,
+                'avg_time_lag': 0,
+                'std_time_lag': 0
+            }
     
     def create_summary_metrics(self):
         """创建概览指标卡片"""
@@ -417,249 +437,245 @@ class HedgeAnalysis:
     
     def create_match_volume_chart(self):
         """匹配量分布图表"""
-        if self.df_relations.empty:
+        try:
+            if self.df_relations.empty or 'Allocated_Vol' not in self.df_relations.columns:
+                return None
+            
+            # 按Cargo_ID汇总
+            cargo_summary = self.df_relations.copy()
+            cargo_summary['Allocated_Vol_Abs'] = abs(cargo_summary['Allocated_Vol'])
+            
+            if 'Cargo_ID' not in cargo_summary.columns:
+                return None
+            
+            cargo_group = cargo_summary.groupby('Cargo_ID')['Allocated_Vol_Abs'].sum().reset_index()
+            
+            # 按匹配量排序，取前20
+            top_cargos = cargo_group.sort_values('Allocated_Vol_Abs', ascending=False).head(20)
+            
+            fig = px.bar(top_cargos, 
+                         x='Cargo_ID', y='Allocated_Vol_Abs',
+                         title='📈 各Cargo_ID匹配量TOP20',
+                         labels={'Allocated_Vol_Abs': '匹配量', 'Cargo_ID': '实货编号'},
+                         color='Allocated_Vol_Abs',
+                         color_continuous_scale='Viridis')
+            fig.update_layout(xaxis_tickangle=-45)
+            return fig
+        except Exception as e:
+            st.warning(f"创建匹配量图表时出错: {e}")
             return None
-        
-        # 按Cargo_ID汇总
-        cargo_summary = self.df_relations.copy()
-        cargo_summary['Allocated_Vol_Abs'] = abs(cargo_summary['Allocated_Vol'])
-        cargo_summary = cargo_summary.groupby('Cargo_ID')['Allocated_Vol_Abs'].sum().reset_index()
-        
-        fig = px.bar(cargo_summary.sort_values('Allocated_Vol_Abs', ascending=False).head(20), 
-                     x='Cargo_ID', y='Allocated_Vol_Abs',
-                     title='📈 各Cargo_ID匹配量TOP20',
-                     labels={'Allocated_Vol_Abs': '匹配量', 'Cargo_ID': '实货编号'},
-                     color='Allocated_Vol_Abs',
-                     color_continuous_scale='Viridis')
-        fig.update_layout(xaxis_tickangle=-45)
-        return fig
     
     def create_pl_analysis_chart(self):
         """P/L分析图表"""
-        if self.df_relations.empty:
+        try:
+            if self.df_relations.empty or 'Alloc_Total_PL' not in self.df_relations.columns:
+                return None
+            
+            # 使用更简单的图表，避免复杂子图
+            fig = px.histogram(self.df_relations, 
+                              x='Alloc_Total_PL',
+                              nbins=30,
+                              title='💰 P/L分布直方图',
+                              labels={'Alloc_Total_PL': 'P/L值'})
+            fig.add_vline(x=0, line_dash="dash", line_color="red")
+            
+            # 添加箱线图显示统计信息
+            fig2 = px.box(self.df_relations, 
+                         y='Alloc_Total_PL',
+                         title='📊 P/L统计箱线图')
+            
+            return fig, fig2
+        except Exception as e:
+            st.warning(f"创建P/L图表时出错: {e}")
+            return None, None
+    
+    def create_simple_pl_chart(self):
+        """简化的P/L图表"""
+        try:
+            if self.df_relations.empty or 'Alloc_Total_PL' not in self.df_relations.columns:
+                return None
+            
+            fig = go.Figure()
+            
+            # 添加直方图
+            fig.add_trace(go.Histogram(
+                x=self.df_relations['Alloc_Total_PL'],
+                nbinsx=30,
+                name='P/L分布',
+                marker_color='skyblue'
+            ))
+            
+            # 添加零线
+            fig.add_vline(x=0, line_dash="dash", line_color="red")
+            
+            fig.update_layout(
+                title='💰 P/L分布分析',
+                xaxis_title='P/L值',
+                yaxis_title='频数',
+                showlegend=False
+            )
+            
+            return fig
+        except Exception as e:
+            st.warning(f"创建简化P/L图表时出错: {e}")
             return None
-        
-        # 创建子图
-        fig = make_subplots(
-            rows=2, cols=2,
-            subplot_titles=('💰 P/L分布直方图', '📊 P/L按Cargo_ID分布',
-                           '📅 P/L按月份分布', '📈 P/L累计曲线'),
-            vertical_spacing=0.15,
-            horizontal_spacing=0.1
-        )
-        
-        # 1. P/L直方图
-        fig.add_trace(
-            go.Histogram(x=self.df_relations['Alloc_Total_PL'], nbinsx=30,
-                        name='P/L分布'),
-            row=1, col=1
-        )
-        fig.add_vline(x=0, line_dash="dash", line_color="red", row=1, col=1)
-        
-        # 2. 按Cargo_ID的P/L分布
-        if 'Cargo_ID' in self.df_relations.columns:
-            cargo_pl = self.df_relations.groupby('Cargo_ID')['Alloc_Total_PL'].sum().reset_index()
-            fig.add_trace(
-                go.Bar(x=cargo_pl['Cargo_ID'], y=cargo_pl['Alloc_Total_PL'],
-                      name='按Cargo_ID'),
-                row=1, col=2
-            )
-            fig.update_xaxes(tickangle=-45, row=1, col=2)
-        
-        # 3. 按月份的P/L分布
-        if 'Month' in self.df_relations.columns:
-            month_pl = self.df_relations.groupby('Month')['Alloc_Total_PL'].sum().reset_index()
-            fig.add_trace(
-                go.Bar(x=month_pl['Month'], y=month_pl['Alloc_Total_PL'],
-                      name='按月份'),
-                row=2, col=1
-            )
-            fig.update_xaxes(tickangle=-45, row=2, col=1)
-        
-        # 4. P/L累计曲线
-        sorted_pl = self.df_relations.sort_values('Alloc_Total_PL')['Alloc_Total_PL']
-        cumulative_pl = sorted_pl.cumsum()
-        fig.add_trace(
-            go.Scatter(x=np.arange(len(cumulative_pl)), y=cumulative_pl,
-                      mode='lines', name='累计P/L'),
-            row=2, col=2
-        )
-        fig.add_hline(y=0, line_dash="dash", line_color="red", row=2, col=2)
-        
-        fig.update_layout(height=700, showlegend=False)
-        return fig
     
     def create_time_analysis_chart(self):
         """时间分析图表"""
-        if self.df_relations.empty or 'Time_Lag' not in self.df_relations.columns:
+        try:
+            if self.df_relations.empty or 'Time_Lag' not in self.df_relations.columns:
+                return None
+            
+            time_lag_data = self.df_relations['Time_Lag'].dropna()
+            if time_lag_data.empty:
+                return None
+            
+            fig = px.histogram(time_lag_data,
+                             nbinsx=30,
+                             title='⏱️ 时间差分布',
+                             labels={'value': '时间差(天)'})
+            fig.add_vline(x=0, line_dash="dash", line_color="green",
+                         annotation_text="完美匹配")
+            
+            return fig
+        except Exception as e:
+            st.warning(f"创建时间分析图表时出错: {e}")
             return None
-        
-        time_lag_data = self.df_relations['Time_Lag'].dropna()
-        if time_lag_data.empty:
-            return None
-        
-        fig = make_subplots(
-            rows=1, cols=2,
-            subplot_titles=('⏱️ 时间差分布', '📅 时间差与P/L关系'),
-            specs=[[{"type": "histogram"}, {"type": "scatter"}]]
-        )
-        
-        # 时间差分布
-        fig.add_trace(
-            go.Histogram(x=time_lag_data, nbinsx=30,
-                        name='时间差分布'),
-            row=1, col=1
-        )
-        fig.add_vline(x=0, line_dash="dash", line_color="green",
-                     annotation_text="完美匹配", row=1, col=1)
-        
-        # 时间差与P/L关系
-        if 'Alloc_Total_PL' in self.df_relations.columns:
-            fig.add_trace(
-                go.Scatter(x=self.df_relations['Time_Lag'],
-                          y=self.df_relations['Alloc_Total_PL'],
-                          mode='markers',
-                          marker=dict(size=8, 
-                                     color=self.df_relations['Allocated_Vol'],
-                                     colorscale='Viridis',
-                                     showscale=True,
-                                     colorbar=dict(title="分配量")),
-                          name='时间差 vs P/L',
-                          text=self.df_relations['Cargo_ID']),
-                row=1, col=2
-            )
-            fig.add_hline(y=0, line_dash="dash", line_color="red", row=1, col=2)
-            fig.add_vline(x=0, line_dash="dash", line_color="green", row=1, col=2)
-        
-        fig.update_layout(height=400)
-        return fig
     
     def create_price_analysis_chart(self):
         """价格分析图表"""
-        if self.df_relations.empty or 'Open_Price' not in self.df_relations.columns:
+        try:
+            if self.df_relations.empty:
+                return None
+            
+            required_cols = ['Open_Price', 'MTM_Price', 'Allocated_Vol']
+            missing_cols = [col for col in required_cols if col not in self.df_relations.columns]
+            
+            if missing_cols:
+                st.info(f"缺少价格分析所需列: {missing_cols}")
+                return None
+            
+            fig = px.scatter(self.df_relations, 
+                            x='Open_Price', 
+                            y='MTM_Price',
+                            size=abs(self.df_relations['Allocated_Vol']),
+                            color='Alloc_Total_PL' if 'Alloc_Total_PL' in self.df_relations.columns else None,
+                            title='💹 开仓价 vs 当前价分析',
+                            labels={'Open_Price': '开仓价', 'MTM_Price': '当前价'},
+                            hover_data=['Cargo_ID', 'Ticket_ID', 'Allocated_Vol'] if 'Cargo_ID' in self.df_relations.columns else [])
+            
+            # 添加平价线
+            min_price = min(self.df_relations['Open_Price'].min(), self.df_relations['MTM_Price'].min())
+            max_price = max(self.df_relations['Open_Price'].max(), self.df_relations['MTM_Price'].max())
+            
+            fig.add_trace(go.Scatter(x=[min_price, max_price],
+                                    y=[min_price, max_price],
+                                    mode='lines',
+                                    name='平价线',
+                                    line=dict(color='red', dash='dash')))
+            
+            return fig
+        except Exception as e:
+            st.warning(f"创建价格分析图表时出错: {e}")
             return None
-        
-        fig = make_subplots(
-            rows=2, cols=2,
-            subplot_titles=('💹 开仓价分布', '📊 价格差异分析',
-                           '💰 价格与P/L关系', '📈 价格走势模拟'),
-            vertical_spacing=0.15
-        )
-        
-        # 1. 开仓价分布
-        fig.add_trace(
-            go.Histogram(x=self.df_relations['Open_Price'], nbinsx=20,
-                        name='开仓价分布'),
-            row=1, col=1
-        )
-        
-        # 2. 价格差异分析
-        if 'MTM_Price' in self.df_relations.columns:
-            price_diff = self.df_relations['MTM_Price'] - self.df_relations['Open_Price']
-            price_diff_pct = (price_diff / self.df_relations['Open_Price'] * 100).fillna(0)
+    
+    def create_month_distribution_chart(self):
+        """月份分布图表"""
+        try:
+            if self.df_relations.empty or 'Month' not in self.df_relations.columns:
+                return None
             
-            fig.add_trace(
-                go.Histogram(x=price_diff_pct, nbinsx=20,
-                            name='价格差异%'),
-                row=1, col=2
-            )
-            fig.add_vline(x=0, line_dash="dash", line_color="red", row=1, col=2)
-        
-        # 3. 价格与P/L关系
-        if 'Alloc_Total_PL' in self.df_relations.columns:
-            fig.add_trace(
-                go.Scatter(x=self.df_relations['Open_Price'],
-                          y=self.df_relations['Alloc_Total_PL'],
-                          mode='markers',
-                          marker=dict(size=8,
-                                     color=abs(self.df_relations['Allocated_Vol']),
-                                     colorscale='Plasma',
-                                     showscale=True),
-                          name='价格 vs P/L'),
-                row=2, col=1
-            )
-        
-        # 4. 价格走势模拟
-        if 'Open_Date' in self.df_relations.columns:
-            daily_prices = self.df_relations.groupby('Open_Date')['Open_Price'].mean().reset_index()
-            daily_prices = daily_prices.sort_values('Open_Date')
+            month_summary = self.df_relations.copy()
+            month_summary['Allocated_Vol_Abs'] = abs(month_summary['Allocated_Vol'])
+            month_group = month_summary.groupby('Month')['Allocated_Vol_Abs'].sum().reset_index()
             
-            fig.add_trace(
-                go.Scatter(x=daily_prices['Open_Date'],
-                          y=daily_prices['Open_Price'],
-                          mode='lines+markers',
-                          name='平均开仓价走势'),
-                row=2, col=2
-            )
-        
-        fig.update_layout(height=600, showlegend=False)
-        return fig
+            fig = px.bar(month_group.sort_values('Allocated_Vol_Abs', ascending=False),
+                         x='Month', y='Allocated_Vol_Abs',
+                         title='📅 各月份匹配量分布',
+                         labels={'Allocated_Vol_Abs': '匹配量', 'Month': '合约月份'},
+                         color='Allocated_Vol_Abs',
+                         color_continuous_scale='Plasma')
+            fig.update_layout(xaxis_tickangle=-45)
+            
+            return fig
+        except Exception as e:
+            st.warning(f"创建月份分布图表时出错: {e}")
+            return None
     
     def create_match_detail_table(self, max_rows=50):
         """创建匹配明细表"""
-        if self.df_relations.empty:
+        try:
+            if self.df_relations.empty:
+                return pd.DataFrame()
+            
+            # 选择要显示的列
+            display_cols = []
+            possible_cols = ['Cargo_ID', 'Ticket_ID', 'Month', 'Allocated_Vol',
+                            'Open_Price', 'MTM_Price', 'Alloc_Total_PL',
+                            'Alloc_Unrealized_MTM', 'Time_Lag', 'Proxy']
+            
+            for col in possible_cols:
+                if col in self.df_relations.columns:
+                    display_cols.append(col)
+            
+            if not display_cols:
+                return pd.DataFrame()
+            
+            # 格式化数字
+            formatted_df = self.df_relations[display_cols].copy()
+            
+            # 数字格式化函数
+            def format_number(x):
+                if isinstance(x, (int, float, np.integer, np.floating)):
+                    return f"{x:,.2f}"
+                return x
+            
+            # 格式化数值列
+            num_cols = ['Allocated_Vol', 'Open_Price', 'MTM_Price', 
+                       'Alloc_Total_PL', 'Alloc_Unrealized_MTM']
+            for col in num_cols:
+                if col in formatted_df.columns:
+                    formatted_df[col] = formatted_df[col].apply(format_number)
+            
+            return formatted_df.head(max_rows)
+        except Exception as e:
+            st.warning(f"创建匹配明细表时出错: {e}")
             return pd.DataFrame()
-        
-        # 选择要显示的列
-        display_cols = []
-        possible_cols = ['Cargo_ID', 'Ticket_ID', 'Month', 'Allocated_Vol',
-                        'Open_Price', 'MTM_Price', 'Alloc_Total_PL',
-                        'Alloc_Unrealized_MTM', 'Time_Lag', 'Proxy']
-        
-        for col in possible_cols:
-            if col in self.df_relations.columns:
-                display_cols.append(col)
-        
-        # 格式化数字
-        formatted_df = self.df_relations[display_cols].copy()
-        
-        # 数字格式化函数
-        def format_number(x):
-            if isinstance(x, (int, float, np.integer, np.floating)):
-                return f"{x:,.2f}"
-            return x
-        
-        # 格式化数值列
-        num_cols = ['Allocated_Vol', 'Open_Price', 'MTM_Price', 
-                   'Alloc_Total_PL', 'Alloc_Unrealized_MTM']
-        for col in num_cols:
-            if col in formatted_df.columns:
-                formatted_df[col] = formatted_df[col].apply(format_number)
-        
-        return formatted_df.head(max_rows)
     
     def create_risk_metrics(self):
         """风险指标计算"""
-        if self.df_relations.empty:
-            return {}
-        
-        risk_metrics = {}
-        
-        # VaR计算 (95%置信水平)
-        if 'Alloc_Total_PL' in self.df_relations.columns:
+        try:
+            if self.df_relations.empty or 'Alloc_Total_PL' not in self.df_relations.columns:
+                return {}
+            
+            risk_metrics = {}
             pl_series = self.df_relations['Alloc_Total_PL']
-            var_95 = np.percentile(pl_series, 5)  # 95% VaR
-            cvar_95 = pl_series[pl_series <= var_95].mean()  # 条件VaR
-            risk_metrics['VaR_95'] = var_95
-            risk_metrics['CVaR_95'] = cvar_95
-            risk_metrics['PL_StdDev'] = pl_series.std()
-            risk_metrics['PL_Max'] = pl_series.max()
-            risk_metrics['PL_Min'] = pl_series.min()
-        
-        # 夏普比率 (假设无风险利率为0)
-        if 'Alloc_Total_PL' in self.df_relations.columns and len(self.df_relations) > 1:
-            avg_pl = self.df_relations['Alloc_Total_PL'].mean()
-            std_pl = self.df_relations['Alloc_Total_PL'].std()
-            risk_metrics['Sharpe_Ratio'] = avg_pl / std_pl if std_pl != 0 else 0
-        
-        # 最大回撤
-        if 'Alloc_Total_PL' in self.df_relations.columns:
-            pl_cumulative = self.df_relations['Alloc_Total_PL'].cumsum()
-            running_max = pl_cumulative.expanding().max()
-            drawdown = (pl_cumulative - running_max) / running_max * 100
-            risk_metrics['Max_Drawdown'] = drawdown.min()
-        
-        return risk_metrics
+            
+            # VaR计算 (95%置信水平)
+            if len(pl_series) > 1:
+                var_95 = np.percentile(pl_series, 5)  # 95% VaR
+                cvar_95 = pl_series[pl_series <= var_95].mean() if len(pl_series[pl_series <= var_95]) > 0 else 0
+                risk_metrics['VaR_95'] = var_95
+                risk_metrics['CVaR_95'] = cvar_95
+                risk_metrics['PL_StdDev'] = pl_series.std()
+                risk_metrics['PL_Max'] = pl_series.max()
+                risk_metrics['PL_Min'] = pl_series.min()
+                
+                # 夏普比率 (假设无风险利率为0)
+                avg_pl = pl_series.mean()
+                std_pl = pl_series.std()
+                risk_metrics['Sharpe_Ratio'] = avg_pl / std_pl if std_pl != 0 else 0
+                
+                # 最大回撤
+                pl_cumulative = pl_series.cumsum()
+                running_max = pl_cumulative.expanding().max()
+                drawdown = (pl_cumulative - running_max) / running_max * 100
+                risk_metrics['Max_Drawdown'] = drawdown.min() if not drawdown.empty else 0
+            
+            return risk_metrics
+        except Exception as e:
+            st.warning(f"计算风险指标时出错: {e}")
+            return {}
 
 # ---------------------------------------------------------
 # 3. Streamlit 主应用
@@ -702,6 +718,13 @@ def main():
         padding: 1rem;
         border-radius: 0.5rem;
         border-left: 4px solid #3B82F6;
+        margin: 1rem 0;
+    }
+    .warning-box {
+        background-color: #FEF3C7;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border-left: 4px solid #F59E0B;
         margin: 1rem 0;
     }
     .metric-card {
@@ -782,12 +805,12 @@ def main():
                 with col1:
                     st.markdown(f"**纸货数据** ({len(df_paper_raw)}行, {len(df_paper_raw.columns)}列)")
                     st.dataframe(df_paper_raw.head(10), use_container_width=True)
-                    st.caption(f"关键字段: {', '.join(df_paper_raw.columns.tolist()[:5])}...")
+                    st.caption(f"字段: {', '.join(df_paper_raw.columns.tolist()[:8])}...")
                 
                 with col2:
                     st.markdown(f"**实货数据** ({len(df_physical_raw)}行, {len(df_physical_raw.columns)}列)")
                     st.dataframe(df_physical_raw.head(10), use_container_width=True)
-                    st.caption(f"关键字段: {', '.join(df_physical_raw.columns.tolist()[:5])}...")
+                    st.caption(f"字段: {', '.join(df_physical_raw.columns.tolist()[:8])}...")
             
             # 执行匹配按钮
             if st.button("🚀 执行套保匹配", type="primary", use_container_width=True):
@@ -798,7 +821,7 @@ def main():
                             df_paper_raw, df_physical_raw
                         )
                         
-                        if df_relations is not None:
+                        if df_relations is not None and not df_relations.empty:
                             # 创建分析模块
                             st.session_state.analysis = HedgeAnalysis(
                                 df_relations, df_physical_updated, df_paper_net
@@ -813,18 +836,27 @@ def main():
                                 tab1, tab2, tab3 = st.tabs(["纸货净仓", "实货更新", "匹配关系"])
                                 
                                 with tab1:
-                                    st.dataframe(df_paper_net.head(20), use_container_width=True)
-                                    st.caption(f"纸货净仓数据 ({len(df_paper_net)}行)")
+                                    if df_paper_net is not None:
+                                        st.dataframe(df_paper_net.head(20), use_container_width=True)
+                                        st.caption(f"纸货净仓数据 ({len(df_paper_net)}行)")
+                                    else:
+                                        st.info("无纸货净仓数据")
                                 
                                 with tab2:
-                                    st.dataframe(df_physical_updated.head(20), use_container_width=True)
-                                    st.caption(f"更新后实货数据 ({len(df_physical_updated)}行)")
+                                    if df_physical_updated is not None:
+                                        st.dataframe(df_physical_updated.head(20), use_container_width=True)
+                                        st.caption(f"更新后实货数据 ({len(df_physical_updated)}行)")
+                                    else:
+                                        st.info("无实货更新数据")
                                 
                                 with tab3:
-                                    st.dataframe(df_relations.head(20), use_container_width=True)
-                                    st.caption(f"匹配关系数据 ({len(df_relations)}行)")
+                                    if df_relations is not None:
+                                        st.dataframe(df_relations.head(20), use_container_width=True)
+                                        st.caption(f"匹配关系数据 ({len(df_relations)}行)")
+                                    else:
+                                        st.info("无匹配关系数据")
                         else:
-                            st.error("匹配过程出现错误，请检查数据格式。")
+                            st.markdown('<div class="warning-box">⚠️ 匹配完成但未生成匹配记录，请检查数据格式和内容</div>', unsafe_allow_html=True)
                             
                     except Exception as e:
                         st.error(f"匹配过程中出现错误: {str(e)}")
@@ -841,23 +873,32 @@ def main():
         
         analysis = st.session_state.analysis
         
+        # 检查是否有匹配数据
+        if analysis.df_relations.empty:
+            st.warning("⚠️ 匹配结果为空，无法进行分析")
+            return
+        
         # 1. 概览指标
         analysis.create_summary_metrics()
         
         # 2. 匹配明细表
         st.markdown('<h3 class="sub-header">📋 匹配明细表</h3>', unsafe_allow_html=True)
         detailed_table = analysis.create_match_detail_table(max_rows)
-        st.dataframe(detailed_table, use_container_width=True)
-        st.caption(f"显示前 {len(detailed_table)} 条记录，共 {len(analysis.df_relations)} 条匹配记录")
+        
+        if not detailed_table.empty:
+            st.dataframe(detailed_table, use_container_width=True)
+            st.caption(f"显示前 {len(detailed_table)} 条记录，共 {len(analysis.df_relations)} 条匹配记录")
+        else:
+            st.info("无匹配明细数据可显示")
         
         # 3. 分析图表
         if show_charts and not analysis.df_relations.empty:
             st.markdown('<h3 class="sub-header">📈 可视化分析</h3>', unsafe_allow_html=True)
             
             # 图表选项卡
-            tab1, tab2, tab3, tab4 = st.tabs([
+            tab1, tab2, tab3, tab4, tab5 = st.tabs([
                 "📊 匹配量分析", "💰 P/L分析", 
-                "⏱️ 时间分析", "💹 价格分析"
+                "⏱️ 时间分析", "💹 价格分析", "📅 月份分布"
             ])
             
             with tab1:
@@ -865,28 +906,58 @@ def main():
                 if fig1:
                     st.plotly_chart(fig1, use_container_width=True)
                 else:
-                    st.info("无匹配量数据")
+                    st.info("无匹配量数据可用于图表分析")
             
             with tab2:
-                fig2 = analysis.create_pl_analysis_chart()
+                fig2 = analysis.create_simple_pl_chart()
                 if fig2:
                     st.plotly_chart(fig2, use_container_width=True)
+                    
+                    # 显示P/L统计数据
+                    if 'Alloc_Total_PL' in analysis.df_relations.columns:
+                        pl_stats = analysis.df_relations['Alloc_Total_PL'].describe()
+                        st.dataframe(pl_stats, use_container_width=True)
                 else:
-                    st.info("无P/L数据")
+                    st.info("无P/L数据可用于图表分析")
             
             with tab3:
                 fig3 = analysis.create_time_analysis_chart()
                 if fig3:
                     st.plotly_chart(fig3, use_container_width=True)
+                    
+                    # 显示时间差统计数据
+                    if 'Time_Lag' in analysis.df_relations.columns:
+                        time_stats = analysis.df_relations['Time_Lag'].describe()
+                        st.dataframe(time_stats, use_container_width=True)
                 else:
-                    st.info("无时间差数据")
+                    st.info("无时间差数据可用于图表分析")
             
             with tab4:
                 fig4 = analysis.create_price_analysis_chart()
                 if fig4:
                     st.plotly_chart(fig4, use_container_width=True)
+                    
+                    # 显示价格统计数据
+                    if 'Open_Price' in analysis.df_relations.columns and 'MTM_Price' in analysis.df_relations.columns:
+                        price_stats = pd.DataFrame({
+                            'Open_Price': analysis.df_relations['Open_Price'].describe(),
+                            'MTM_Price': analysis.df_relations['MTM_Price'].describe()
+                        }).T
+                        st.dataframe(price_stats, use_container_width=True)
                 else:
-                    st.info("无价格数据")
+                    st.info("无价格数据可用于图表分析")
+            
+            with tab5:
+                fig5 = analysis.create_month_distribution_chart()
+                if fig5:
+                    st.plotly_chart(fig5, use_container_width=True)
+                    
+                    # 显示月份统计数据
+                    if 'Month' in analysis.df_relations.columns:
+                        month_stats = analysis.df_relations['Month'].value_counts()
+                        st.dataframe(month_stats, use_container_width=True)
+                else:
+                    st.info("无月份数据可用于图表分析")
         
         # 4. 风险指标
         if show_risk and not analysis.df_relations.empty:
@@ -913,6 +984,8 @@ def main():
                 with st.expander("查看详细风险指标"):
                     risk_df = pd.DataFrame.from_dict(risk_metrics, orient='index', columns=['值'])
                     st.dataframe(risk_df.style.format("{:,.2f}"), use_container_width=True)
+            else:
+                st.info("无法计算风险指标，可能需要更多数据")
         
         # 5. 数据导出
         st.markdown("---")
@@ -1020,49 +1093,18 @@ def main():
                 - `Trade Date`: 交易日期
                 - `Volume`: 交易量 (正买负卖)
                 - `Commodity`: 商品品种
-                - `Month`: 合约月份 (可选)
-                - `Price`: 交易价格 (可选)
                 
                 **实货数据必需字段:**
                 - `Cargo_ID`: 实货编号
                 - `Volume`: 交易量
                 - `Hedge_Proxy`: 套保代理
-                - `Target_Contract_Month`: 目标月份
-                - `Direction`: 方向 (Buy/Sell)
                 
                 **可选字段:**
+                - `Month`: 合约月份
+                - `Price`: 交易价格
+                - `Target_Contract_Month`: 目标月份
                 - `Designation_Date`: 指定日期
-                - `Pricing_Benchmark`: 定价基准
-                - `Pricing_Start`: 定价开始日期
                 """)
-            
-            st.markdown("---")
-            
-            # 示例数据展示
-            with st.expander("📚 查看数据格式示例"):
-                example_tab1, example_tab2 = st.tabs(["纸货示例", "实货示例"])
-                
-                with example_tab1:
-                    example_paper = pd.DataFrame({
-                        'Trade Date': ['2024-01-15', '2024-01-16', '2024-01-17'],
-                        'Volume': [1000, -500, 2000],
-                        'Commodity': ['BRENT', 'BRENT', 'JCC'],
-                        'Month': ['JAN 25', 'JAN 25', 'FEB 25'],
-                        'Price': [75.50, 76.20, 74.80],
-                        'Recap No': ['TKT-001', 'TKT-002', 'TKT-003']
-                    })
-                    st.dataframe(example_paper, use_container_width=True)
-                
-                with example_tab2:
-                    example_physical = pd.DataFrame({
-                        'Cargo_ID': ['PHY-2025-001', 'PHY-2025-002', 'PHY-2025-003'],
-                        'Volume': [500000, 300000, 400000],
-                        'Hedge_Proxy': ['BRENT', 'JCC', 'BRENT'],
-                        'Target_Contract_Month': ['JAN 25', 'FEB 25', 'JAN 25'],
-                        'Direction': ['Buy', 'Buy', 'Sell'],
-                        'Designation_Date': ['2024-01-10', '2024-01-15', '2024-01-20']
-                    })
-                    st.dataframe(example_physical, use_container_width=True)
 
 if __name__ == "__main__":
     main()
