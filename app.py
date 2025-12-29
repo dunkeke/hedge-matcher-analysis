@@ -205,7 +205,7 @@ class HedgeMatchingEngine:
             target_month = cargo.get('Target_Contract_Month', None)
             desig_date = cargo.get('Designation_Date', pd.NaT)
             if pd.notna(desig_date):
-                cargo_start_date = pd.Timestamp(year=desig_date.year, month=11, day=12)
+                cargo_start_date = desig_date.normalize()
             else:
                 cargo_start_date = default_match_start_date
             benchmark = str(cargo.get('Pricing_Benchmark', '')).upper()
