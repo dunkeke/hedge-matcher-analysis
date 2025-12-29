@@ -143,7 +143,7 @@ class HedgeMatchingEngine:
         default_match_start_date = pd.NaT
         trade_years = df_paper_net['Trade Date'].dropna().dt.year
         if not trade_years.empty:
-            default_match_start_date = pd.Timestamp(year=int(trade_years.max()), month=11, day=12)
+            default_match_start_date = pd.Timestamp(year=int(trade_years.max()), month=11, day=13)
 
         active_paper = df_paper_net[df_paper_net['Net_Open_Vol'] > 0.0001].copy()
         active_paper['Allocated_To_Phy'] = 0.0
@@ -204,7 +204,7 @@ class HedgeMatchingEngine:
             target_month = cargo.get('Target_Contract_Month', None)
             desig_date = cargo.get('Designation_Date', pd.NaT)
             if pd.notna(desig_date):
-                cargo_start_date = pd.Timestamp(year=desig_date.year, month=11, day=12)
+                cargo_start_date = pd.Timestamp(year=desig_date.year, month=11, day=13)
             else:
                 cargo_start_date = default_match_start_date
             benchmark = str(cargo.get('Pricing_Benchmark', '')).upper()
