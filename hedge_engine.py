@@ -191,7 +191,7 @@ def auto_match_hedges(physical_df, paper_df):
     default_match_start_date = pd.NaT
     trade_years = paper_df['Trade Date'].dropna().dt.year
     if not trade_years.empty:
-        default_match_start_date = pd.Timestamp(year=int(trade_years.max()), month=11, day=13)
+        default_match_start_date = pd.Timestamp(year=int(trade_years.max()), month=11, day=12)
 
     # 强制初始化
     paper_df['Allocated_To_Phy'] = 0.0
@@ -244,7 +244,7 @@ def auto_match_hedges(physical_df, paper_df):
         target_month = cargo.get('Target_Contract_Month', None)
         desig_date = cargo.get('Designation_Date', pd.NaT)
         if pd.notna(desig_date):
-            cargo_start_date = pd.Timestamp(year=desig_date.year, month=11, day=13)
+            cargo_start_date = pd.Timestamp(year=desig_date.year, month=11, day=12)
         else:
             cargo_start_date = default_match_start_date
         benchmark = str(cargo.get('Pricing_Benchmark', '')).upper()

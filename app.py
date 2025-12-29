@@ -28,6 +28,7 @@ class HedgeMatchingEngine:
         self.df_relations = None
         self.df_physical_updated = None
         self.df_cargo_summary = None
+        self.df_overall_summary = None
         
     def clean_str(self, series):
         """清洗字符串"""
@@ -143,7 +144,7 @@ class HedgeMatchingEngine:
         default_match_start_date = pd.NaT
         trade_years = df_paper_net['Trade Date'].dropna().dt.year
         if not trade_years.empty:
-            default_match_start_date = pd.Timestamp(year=int(trade_years.max()), month=11, day=13)
+            default_match_start_date = pd.Timestamp(year=int(trade_years.max()), month=11, day=12)
 
         active_paper = df_paper_net[df_paper_net['Net_Open_Vol'] > 0.0001].copy()
         active_paper['Allocated_To_Phy'] = 0.0
@@ -204,7 +205,7 @@ class HedgeMatchingEngine:
             target_month = cargo.get('Target_Contract_Month', None)
             desig_date = cargo.get('Designation_Date', pd.NaT)
             if pd.notna(desig_date):
-                cargo_start_date = pd.Timestamp(year=desig_date.year, month=11, day=13)
+                cargo_start_date = pd.Timestamp(year=desig_date.year, month=11, day=12)
             else:
                 cargo_start_date = default_match_start_date
             benchmark = str(cargo.get('Pricing_Benchmark', '')).upper()
@@ -341,6 +342,22 @@ class HedgeMatchingEngine:
         if not df_relations.empty:
             df_relations['Abs_Allocated_Vol'] = df_relations['Allocated_Vol'].abs()
             df_relations['Close_Value'] = df_relations['Allocated_Close_Vol'] * df_relations['Close_WAP']
+            total_open_vol = df_relations['Abs_Allocated_Vol'].sum()
+            total_close_vol = df_relations['Allocated_Close_Vol'].sum()
+            total_open_wap = (
+                (df_relations['Abs_Allocated_Vol'] * df_relations['Open_Price']).sum() / total_open_vol
+                if total_open_vol > 0 else 0
+            )
+            total_close_wap = (
+                df_relations['Close_Value'].sum() / total_close_vol
+                if total_close_vol > 0 else 0
+            )
+            self.df_overall_summary = pd.DataFrame([{
+                'Matched_Open_Vol': total_open_vol,
+                'Open_WAP': total_open_wap,
+                'Matched_Close_Vol': total_close_vol,
+                'Close_WAP': total_close_wap
+            }])
             open_summary = df_relations.groupby('Cargo_ID').apply(
                 lambda grp: pd.Series({
                     'Matched_Open_Vol': grp['Abs_Allocated_Vol'].sum(),
@@ -381,6 +398,14 @@ class HedgeMatchingEngine:
                     'Post_1112_Open_WAP',
                     'Post_1112_Close_Vol',
                     'Post_1112_Close_WAP'
+                ]
+            )
+            self.df_overall_summary = pd.DataFrame(
+                columns=[
+                    'Matched_Open_Vol',
+                    'Open_WAP',
+                    'Matched_Close_Vol',
+                    'Close_WAP'
                 ]
             )
         st.success(f"✅ 实货匹配完成！共生成 {len(df_relations)} 条匹配记录")
@@ -952,7 +977,7 @@ def main():
                             
                             # 显示匹配过程数据
                             with st.expander("📊 匹配过程数据", expanded=False):
-                                tab1, tab2, tab3, tab4 = st.tabs(["纸货净仓", "实货更新", "匹配关系", "实货汇总"])
+                                tab1, tab2, tab3, tab4, tab5 = st.tabs(["纸货净仓", "实货更新", "匹配关系", "实货汇总", "总体汇总"])
                                 
                                 with tab1:
                                     if df_paper_net is not None:
@@ -985,6 +1010,14 @@ def main():
                                         st.caption(f"实货汇总数据 ({len(phy_2026)}行)")
                                     else:
                                         st.info("无实货汇总数据")
+
+                                with tab5:
+                                    overall_df = st.session_state.engine.df_overall_summary
+                                    if overall_df is not None and not overall_df.empty:
+                                        st.dataframe(overall_df, use_container_width=True)
+                                        st.caption("所有匹配开仓/平仓加权均价汇总")
+                                    else:
+                                        st.info("无总体汇总数据")
                         else:
                             st.markdown('<div class="warning-box">⚠️ 匹配完成但未生成匹配记录，请检查数据格式和内容</div>', unsafe_allow_html=True)
                             
