@@ -27,6 +27,7 @@ class HedgeMatchingEngine:
         self.df_paper_net = None
         self.df_relations = None
         self.df_physical_updated = None
+        self.df_cargo_summary = None
         
     def clean_str(self, series):
         """清洗字符串"""
@@ -139,14 +140,12 @@ class HedgeMatchingEngine:
         progress_bar = st.progress(0)
         
         hedge_relations = []
-        match_start_date = pd.NaT
+        default_match_start_date = pd.NaT
         trade_years = df_paper_net['Trade Date'].dropna().dt.year
         if not trade_years.empty:
-            match_start_date = pd.Timestamp(year=int(trade_years.max()), month=11, day=12)
+            default_match_start_date = pd.Timestamp(year=int(trade_years.max()), month=11, day=12)
 
         active_paper = df_paper_net[df_paper_net['Net_Open_Vol'] > 0.0001].copy()
-        if pd.notna(match_start_date):
-            active_paper = active_paper[active_paper['Trade Date'] >= match_start_date]
         active_paper['Allocated_To_Phy'] = 0.0
         active_paper['_original_index'] = active_paper.index
 
@@ -160,7 +159,7 @@ class HedgeMatchingEngine:
 
         close_event_pool = {}
         for _, ticket in active_paper.iterrows():
-            events = filter_close_events(ticket.get('Close_Events', []), match_start_date)
+            events = ticket.get('Close_Events', []) or []
             if events:
                 sorted_events = sorted(
                     events,
@@ -169,7 +168,8 @@ class HedgeMatchingEngine:
                 close_event_pool[ticket['_original_index']] = deque(
                     {
                         'remaining': float(e.get('Vol', 0)),
-                        'price': e.get('Price', 0)
+                        'price': e.get('Price', 0),
+                        'date': e.get('Date')
                     }
                     for e in sorted_events
                     if abs(e.get('Vol', 0)) > 0.0001
@@ -203,6 +203,10 @@ class HedgeMatchingEngine:
             proxy = str(cargo.get('Hedge_Proxy', ''))
             target_month = cargo.get('Target_Contract_Month', None)
             desig_date = cargo.get('Designation_Date', pd.NaT)
+            if pd.notna(desig_date):
+                cargo_start_date = pd.Timestamp(year=desig_date.year, month=11, day=12)
+            else:
+                cargo_start_date = default_match_start_date
             benchmark = str(cargo.get('Pricing_Benchmark', '')).upper()
             proxy_candidates = [proxy] if proxy else []
             if 'BRENT' in benchmark:
@@ -214,10 +218,13 @@ class HedgeMatchingEngine:
                     break
 
                 # 筛选候选交易
-                candidates_df = active_paper[
+                mask = (
                     (active_paper['Std_Commodity'].str.contains(proxy_value, regex=False)) &
                     (active_paper['Month'] == target_month)
-                ].copy()
+                )
+                if pd.notna(cargo_start_date):
+                    mask &= active_paper['Trade Date'] >= cargo_start_date
+                candidates_df = active_paper[mask].copy()
 
                 if candidates_df.empty:
                     continue
@@ -259,7 +266,7 @@ class HedgeMatchingEngine:
                     if close_events:
                         try:
                             sorted_events = sorted(
-                                filter_close_events(close_events, match_start_date),
+                                filter_close_events(close_events, cargo_start_date),
                                 key=lambda x: x['Date'] if pd.notna(x['Date']) else pd.Timestamp.min
                             )
                             details = []
@@ -279,6 +286,11 @@ class HedgeMatchingEngine:
                     close_volume = 0.0
                     close_price_total = 0.0
                     close_queue = close_event_pool.get(original_index, deque())
+                    while close_queue and pd.notna(cargo_start_date):
+                        peek = close_queue[0]
+                        if pd.isna(peek.get('date')) or peek['date'] >= cargo_start_date:
+                            break
+                        close_queue.popleft()
                     remaining = abs(alloc_amt)
                     while remaining > 0 and close_queue:
                         event = close_queue[0]
@@ -344,6 +356,11 @@ class HedgeMatchingEngine:
             df_physical['Post_1112_Open_WAP'] = df_physical['Open_WAP']
             df_physical['Post_1112_Close_Vol'] = df_physical['Matched_Close_Vol']
             df_physical['Post_1112_Close_WAP'] = df_physical['Close_WAP']
+            self.df_cargo_summary = open_summary.copy()
+            self.df_cargo_summary['Post_1112_Open_Vol'] = self.df_cargo_summary['Matched_Open_Vol']
+            self.df_cargo_summary['Post_1112_Open_WAP'] = self.df_cargo_summary['Open_WAP']
+            self.df_cargo_summary['Post_1112_Close_Vol'] = self.df_cargo_summary['Matched_Close_Vol']
+            self.df_cargo_summary['Post_1112_Close_WAP'] = self.df_cargo_summary['Close_WAP']
         else:
             df_physical['Matched_Open_Vol'] = 0.0
             df_physical['Open_WAP'] = 0.0
@@ -353,6 +370,19 @@ class HedgeMatchingEngine:
             df_physical['Post_1112_Open_WAP'] = 0.0
             df_physical['Post_1112_Close_Vol'] = 0.0
             df_physical['Post_1112_Close_WAP'] = 0.0
+            self.df_cargo_summary = pd.DataFrame(
+                columns=[
+                    'Cargo_ID',
+                    'Matched_Open_Vol',
+                    'Open_WAP',
+                    'Matched_Close_Vol',
+                    'Close_WAP',
+                    'Post_1112_Open_Vol',
+                    'Post_1112_Open_WAP',
+                    'Post_1112_Close_Vol',
+                    'Post_1112_Close_WAP'
+                ]
+            )
         st.success(f"✅ 实货匹配完成！共生成 {len(df_relations)} 条匹配记录")
         
         return df_relations, df_physical
@@ -922,7 +952,7 @@ def main():
                             
                             # 显示匹配过程数据
                             with st.expander("📊 匹配过程数据", expanded=False):
-                                tab1, tab2, tab3 = st.tabs(["纸货净仓", "实货更新", "匹配关系"])
+                                tab1, tab2, tab3, tab4 = st.tabs(["纸货净仓", "实货更新", "匹配关系", "实货汇总"])
                                 
                                 with tab1:
                                     if df_paper_net is not None:
@@ -944,6 +974,17 @@ def main():
                                         st.caption(f"匹配关系数据 ({len(df_relations)}行)")
                                     else:
                                         st.info("无匹配关系数据")
+
+                                with tab4:
+                                    summary_df = st.session_state.engine.df_cargo_summary
+                                    if summary_df is not None and not summary_df.empty:
+                                        phy_2026 = summary_df[
+                                            summary_df['Cargo_ID'].astype(str).str.upper().str.startswith('PHY-2026')
+                                        ]
+                                        st.dataframe(phy_2026, use_container_width=True)
+                                        st.caption(f"实货汇总数据 ({len(phy_2026)}行)")
+                                    else:
+                                        st.info("无实货汇总数据")
                         else:
                             st.markdown('<div class="warning-box">⚠️ 匹配完成但未生成匹配记录，请检查数据格式和内容</div>', unsafe_allow_html=True)
                             

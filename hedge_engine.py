@@ -188,18 +188,16 @@ def auto_match_hedges(physical_df, paper_df):
     """Step 2: 实货匹配 (Safe Update Version)"""
     hedge_relations = []
 
-    match_start_date = pd.NaT
+    default_match_start_date = pd.NaT
     trade_years = paper_df['Trade Date'].dropna().dt.year
     if not trade_years.empty:
-        match_start_date = pd.Timestamp(year=int(trade_years.max()), month=11, day=12)
+        default_match_start_date = pd.Timestamp(year=int(trade_years.max()), month=11, day=12)
 
     # 强制初始化
     paper_df['Allocated_To_Phy'] = 0.0
 
     # 索引构建
     active_paper = paper_df[paper_df['Net_Open_Vol'] > 0.0001].copy()
-    if pd.notna(match_start_date):
-        active_paper = active_paper[active_paper['Trade Date'] >= match_start_date]
     active_paper['Allocated_To_Phy'] = 0.0
     active_paper['_original_index'] = active_paper.index
 
@@ -213,7 +211,7 @@ def auto_match_hedges(physical_df, paper_df):
 
     close_event_pool = {}
     for _, ticket in active_paper.iterrows():
-        events = filter_close_events(ticket.get('Close_Events', []), match_start_date)
+        events = ticket.get('Close_Events', []) or []
         if events:
             sorted_events = sorted(
                 events,
@@ -222,7 +220,8 @@ def auto_match_hedges(physical_df, paper_df):
             close_event_pool[ticket['_original_index']] = deque(
                 {
                     'remaining': float(e.get('Vol', 0)),
-                    'price': e.get('Price', 0)
+                    'price': e.get('Price', 0),
+                    'date': e.get('Date')
                 }
                 for e in sorted_events
                 if abs(e.get('Vol', 0)) > 0.0001
@@ -244,6 +243,10 @@ def auto_match_hedges(physical_df, paper_df):
         proxy = str(cargo['Hedge_Proxy'])
         target_month = cargo.get('Target_Contract_Month', None)
         desig_date = cargo.get('Designation_Date', pd.NaT)
+        if pd.notna(desig_date):
+            cargo_start_date = pd.Timestamp(year=desig_date.year, month=11, day=12)
+        else:
+            cargo_start_date = default_match_start_date
         benchmark = str(cargo.get('Pricing_Benchmark', '')).upper()
         proxy_candidates = [proxy] if proxy else []
         if 'BRENT' in benchmark:
@@ -258,6 +261,8 @@ def auto_match_hedges(physical_df, paper_df):
                 (active_paper['Std_Commodity'].str.contains(proxy_value, regex=False)) &
                 (active_paper['Month'] == target_month)
             )
+            if pd.notna(cargo_start_date):
+                mask &= active_paper['Trade Date'] >= cargo_start_date
             candidates_df = active_paper[mask].copy()
 
             if candidates_df.empty:
@@ -295,7 +300,7 @@ def auto_match_hedges(physical_df, paper_df):
                 mtm_price = ticket.get('Mtm Price', 0)
                 total_pl = ticket.get('Total P/L', 0)
                 close_path, _ = format_close_details(
-                    filter_close_events(ticket.get('Close_Events', []), match_start_date)
+                    filter_close_events(ticket.get('Close_Events', []), cargo_start_date)
                 )
 
                 unrealized_mtm = (mtm_price - open_price) * alloc_amt
@@ -308,6 +313,11 @@ def auto_match_hedges(physical_df, paper_df):
                 close_volume = 0.0
                 close_price_total = 0.0
                 close_queue = close_event_pool.get(orig_idx, deque())
+                while close_queue and pd.notna(cargo_start_date):
+                    peek = close_queue[0]
+                    if pd.isna(peek.get('date')) or peek['date'] >= cargo_start_date:
+                        break
+                    close_queue.popleft()
                 remaining = abs(alloc_amt)
                 while remaining > 0 and close_queue:
                     event = close_queue[0]
