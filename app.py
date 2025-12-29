@@ -27,6 +27,8 @@ class HedgeMatchingEngine:
         self.df_paper_net = None
         self.df_relations = None
         self.df_physical_updated = None
+        self.df_cargo_summary = None
+        self.df_overall_summary = None
         
     def clean_str(self, series):
         """清洗字符串"""
@@ -139,23 +141,56 @@ class HedgeMatchingEngine:
         progress_bar = st.progress(0)
         
         hedge_relations = []
-        active_paper = df_paper_net.copy()
+        default_match_start_date = pd.NaT
+        trade_years = df_paper_net['Trade Date'].dropna().dt.year
+        if not trade_years.empty:
+            default_match_start_date = pd.Timestamp(year=int(trade_years.max()), month=11, day=12)
+
+        active_paper = df_paper_net[df_paper_net['Net_Open_Vol'] > 0.0001].copy()
         active_paper['Allocated_To_Phy'] = 0.0
         active_paper['_original_index'] = active_paper.index
+
+        def filter_close_events(events, start_date):
+            if pd.isna(start_date):
+                return list(events or [])
+            return [
+                event for event in (events or [])
+                if pd.notna(event.get('Date')) and event.get('Date') >= start_date
+            ]
+
+        close_event_pool = {}
+        for _, ticket in active_paper.iterrows():
+            events = ticket.get('Close_Events', []) or []
+            if events:
+                sorted_events = sorted(
+                    events,
+                    key=lambda x: x['Date'] if pd.notna(x.get('Date')) else pd.Timestamp.min
+                )
+                close_event_pool[ticket['_original_index']] = deque(
+                    {
+                        'remaining': float(e.get('Vol', 0)),
+                        'price': e.get('Price', 0),
+                        'date': e.get('Date')
+                    }
+                    for e in sorted_events
+                    if abs(e.get('Vol', 0)) > 0.0001
+                )
         
         df_phy = df_physical.copy()
         df_phy['_orig_idx'] = df_phy.index
         
-        # BRENT优先匹配
+        # BRENT优先匹配 + 指定货物优先级
+        priority_cargos = {'PHY-2026-004', 'PHY-2026-005'}
         if 'Pricing_Benchmark' in df_phy.columns:
-            def bench_prio(x):
-                x_str = str(x).upper()
-                return 0 if 'BRENT' in x_str else 1
-            df_phy['_priority'] = df_phy['Pricing_Benchmark'].apply(bench_prio)
-            df_phy = df_phy.sort_values(by=['_priority', '_orig_idx']).reset_index(drop=True)
-            df_phy = df_phy.drop(columns=['_priority'])
+            df_phy['_bench_priority'] = df_phy['Pricing_Benchmark'].astype(str).str.upper().str.contains('BRENT')
         else:
-            df_phy = df_phy.reset_index(drop=True)
+            df_phy['_bench_priority'] = False
+        df_phy['_cargo_priority'] = df_phy['Cargo_ID'].astype(str).str.upper().isin(priority_cargos)
+        df_phy = df_phy.sort_values(
+            by=['_bench_priority', '_cargo_priority', '_orig_idx'],
+            ascending=[False, False, True]
+        ).reset_index(drop=True)
+        df_phy = df_phy.drop(columns=['_bench_priority', '_cargo_priority'])
         
         total_cargos = len(df_phy)
         
@@ -168,93 +203,133 @@ class HedgeMatchingEngine:
             
             proxy = str(cargo.get('Hedge_Proxy', ''))
             target_month = cargo.get('Target_Contract_Month', None)
-            phy_dir = cargo.get('Direction', 'Buy')
             desig_date = cargo.get('Designation_Date', pd.NaT)
-            
-            # 筛选候选交易
-            candidates_df = active_paper[
-                (active_paper['Std_Commodity'].str.contains(proxy, regex=False)) &
-                (active_paper['Month'] == target_month)
-            ].copy()
-            
-            if candidates_df.empty:
-                continue
-            
-            # 时间排序：有指定日期按时间差，否则FIFO
-            if pd.notna(desig_date) and not candidates_df['Trade Date'].isnull().all():
-                candidates_df['Time_Lag_Days'] = (candidates_df['Trade Date'] - desig_date).dt.days
-                candidates_df['Abs_Lag'] = candidates_df['Time_Lag_Days'].abs()
-                candidates_df = candidates_df.sort_values(by=['Abs_Lag', 'Trade Date'])
+            if pd.notna(desig_date):
+                cargo_start_date = pd.Timestamp(year=desig_date.year, month=11, day=12)
             else:
-                candidates_df['Time_Lag_Days'] = np.nan
-                candidates_df = candidates_df.sort_values(by='Trade Date')
+                cargo_start_date = default_match_start_date
+            benchmark = str(cargo.get('Pricing_Benchmark', '')).upper()
+            proxy_candidates = [proxy] if proxy else []
+            if 'BRENT' in benchmark:
+                proxy_candidates = proxy_candidates or []
+                proxy_candidates.extend(['PHY-2026-001', 'PHY-2026-002', 'PHY-2026-003'])
             
-            # 分配匹配
-            for _, ticket in candidates_df.iterrows():
+            for proxy_value in proxy_candidates:
                 if abs(phy_vol) < 1:
                     break
-                
-                original_index = ticket['_original_index']
-                curr_allocated = active_paper.at[original_index, 'Allocated_To_Phy']
-                curr_total_vol = ticket.get('Volume', 0)
-                avail = curr_total_vol - curr_allocated
-                
-                if abs(avail) < 0.0001:
+
+                # 筛选候选交易
+                mask = (
+                    (active_paper['Std_Commodity'].str.contains(proxy_value, regex=False)) &
+                    (active_paper['Month'] == target_month)
+                )
+                if pd.notna(cargo_start_date):
+                    mask &= active_paper['Trade Date'] >= cargo_start_date
+                candidates_df = active_paper[mask].copy()
+
+                if candidates_df.empty:
                     continue
-                
-                alloc_amt_abs = abs(phy_vol) if abs(avail) >= abs(phy_vol) else abs(avail)
-                alloc_amt = np.sign(avail) * alloc_amt_abs
-                phy_vol -= alloc_amt_abs
-                active_paper.at[original_index, 'Allocated_To_Phy'] += alloc_amt
-                
-                # 计算财务指标
-                open_price = ticket.get('Price', 0)
-                mtm_price = ticket.get('Mtm Price', open_price)  # 默认为开仓价
-                total_pl_raw = ticket.get('Total P/L', 0)
-                close_events = ticket.get('Close_Events', [])
-                
-                # 格式化平仓路径
-                close_path_str = ""
-                if close_events:
-                    try:
-                        sorted_events = sorted(close_events, key=lambda x: x['Date'] if pd.notna(x['Date']) else pd.Timestamp.min)
-                        details = []
-                        for e in sorted_events:
-                            d_str = e['Date'].strftime('%Y-%m-%d') if pd.notna(e['Date']) else 'N/A'
-                            p_str = f"@{e['Price']}" if pd.notna(e['Price']) else ""
-                            details.append(f"[{d_str} Tkt#{e['Ref']} Vol:{e['Vol']:.0f} {p_str}]")
-                        close_path_str = " -> ".join(details)
-                    except:
-                        close_path_str = str(close_events)
-                
-                # 计算分配比例
-                ratio = abs(alloc_amt) / abs(curr_total_vol) if abs(curr_total_vol) > 0 else 0
-                unrealized_mtm = (mtm_price - open_price) * alloc_amt
-                allocated_total_pl = total_pl_raw * ratio
-                
-                hedge_relations.append({
-                    'Cargo_ID': cargo_id,
-                    'Proxy': proxy,
-                    'Designation_Date': desig_date,
-                    'Open_Date': ticket.get('Trade Date'),
-                    'Time_Lag': ticket.get('Time_Lag_Days'),
-                    'Ticket_ID': ticket.get('Recap No'),
-                    'Month': ticket.get('Month'),
-                    'Allocated_Vol': alloc_amt,
-                    'Trade_Volume': ticket.get('Volume', 0),
-                    'Trade_Net_Open': ticket.get('Net_Open_Vol', 0),
-                    'Trade_Closed_Vol': ticket.get('Closed_Vol', 0),
-                    'Open_Price': open_price,
-                    'MTM_Price': mtm_price,
-                    'Alloc_Unrealized_MTM': round(unrealized_mtm, 2),
-                    'Alloc_Total_PL': round(allocated_total_pl, 2),
-                    'Close_Path_Details': close_path_str,
-                })
-                
-                # 更新实货未对冲量
-                orig_idx = cargo.get('_orig_idx')
-                if orig_idx in df_physical.index:
-                    df_physical.at[orig_idx, 'Unhedged_Volume'] = phy_vol
+
+                # 时间排序：有指定日期按时间差，否则FIFO
+                if pd.notna(desig_date) and not candidates_df['Trade Date'].isnull().all():
+                    candidates_df['Time_Lag_Days'] = (candidates_df['Trade Date'] - desig_date).dt.days
+                    candidates_df['Abs_Lag'] = candidates_df['Time_Lag_Days'].abs()
+                    candidates_df = candidates_df.sort_values(by=['Abs_Lag', 'Trade Date'])
+                else:
+                    candidates_df['Time_Lag_Days'] = np.nan
+                    candidates_df = candidates_df.sort_values(by='Trade Date')
+
+                # 分配匹配
+                for _, ticket in candidates_df.iterrows():
+                    if abs(phy_vol) < 1:
+                        break
+
+                    original_index = ticket['_original_index']
+                    curr_allocated = active_paper.at[original_index, 'Allocated_To_Phy']
+                    curr_net_open = ticket.get('Net_Open_Vol', 0)
+                    avail = curr_net_open - curr_allocated
+
+                    if abs(avail) < 0.0001:
+                        continue
+
+                    alloc_amt = min(avail, phy_vol)
+                    phy_vol -= alloc_amt
+                    active_paper.at[original_index, 'Allocated_To_Phy'] += alloc_amt
+
+                    # 计算财务指标
+                    open_price = ticket.get('Price', 0)
+                    mtm_price = ticket.get('Mtm Price', open_price)  # 默认为开仓价
+                    total_pl_raw = ticket.get('Total P/L', 0)
+                    close_events = ticket.get('Close_Events', [])
+
+                    # 格式化平仓路径
+                    close_path_str = ""
+                    if close_events:
+                        try:
+                            sorted_events = sorted(
+                                filter_close_events(close_events, cargo_start_date),
+                                key=lambda x: x['Date'] if pd.notna(x['Date']) else pd.Timestamp.min
+                            )
+                            details = []
+                            for e in sorted_events:
+                                d_str = e['Date'].strftime('%Y-%m-%d') if pd.notna(e['Date']) else 'N/A'
+                                p_str = f"@{e['Price']}" if pd.notna(e['Price']) else ""
+                                details.append(f"[{d_str} Tkt#{e['Ref']} Vol:{e['Vol']:.0f} {p_str}]")
+                            close_path_str = " -> ".join(details)
+                        except:
+                            close_path_str = str(close_events)
+
+                    # 计算分配比例
+                    ratio = abs(alloc_amt) / abs(ticket.get('Volume', 0)) if abs(ticket.get('Volume', 0)) > 0 else 0
+                    unrealized_mtm = (mtm_price - open_price) * alloc_amt
+                    allocated_total_pl = total_pl_raw * ratio
+
+                    close_volume = 0.0
+                    close_price_total = 0.0
+                    close_queue = close_event_pool.get(original_index, deque())
+                    while close_queue and pd.notna(cargo_start_date):
+                        peek = close_queue[0]
+                        if pd.isna(peek.get('date')) or peek['date'] >= cargo_start_date:
+                            break
+                        close_queue.popleft()
+                    remaining = abs(alloc_amt)
+                    while remaining > 0 and close_queue:
+                        event = close_queue[0]
+                        take = min(remaining, event['remaining'])
+                        close_volume += take
+                        close_price_total += take * event['price']
+                        event['remaining'] -= take
+                        remaining -= take
+                        if event['remaining'] < 0.0001:
+                            close_queue.popleft()
+                    close_event_pool[original_index] = close_queue
+                    close_wap = (close_price_total / close_volume) if close_volume > 0 else 0
+
+                    hedge_relations.append({
+                        'Cargo_ID': cargo_id,
+                        'Proxy': proxy_value,
+                        'Designation_Date': desig_date,
+                        'Open_Date': ticket.get('Trade Date'),
+                        'Time_Lag': ticket.get('Time_Lag_Days'),
+                        'Ticket_ID': ticket.get('Recap No'),
+                        'Month': ticket.get('Month'),
+                        'Allocated_Vol': alloc_amt,
+                        'Trade_Volume': ticket.get('Volume', 0),
+                        'Trade_Net_Open': ticket.get('Net_Open_Vol', 0),
+                        'Trade_Closed_Vol': ticket.get('Closed_Vol', 0),
+                        'Open_Price': open_price,
+                        'MTM_Price': mtm_price,
+                        'Alloc_Unrealized_MTM': round(unrealized_mtm, 2),
+                        'Alloc_Total_PL': round(allocated_total_pl, 2),
+                        'Close_Path_Details': close_path_str,
+                        'Allocated_Close_Vol': close_volume,
+                        'Close_WAP': close_wap,
+                    })
+
+                    # 更新实货未对冲量
+                    orig_idx = cargo.get('_orig_idx')
+                    if orig_idx in df_physical.index:
+                        df_physical.at[orig_idx, 'Unhedged_Volume'] = phy_vol
             
             progress_bar.progress((idx + 1) / total_cargos)
         
@@ -264,6 +339,75 @@ class HedgeMatchingEngine:
         
         progress_bar.progress(1.0)
         df_relations = pd.DataFrame(hedge_relations)
+        if not df_relations.empty:
+            df_relations['Abs_Allocated_Vol'] = df_relations['Allocated_Vol'].abs()
+            df_relations['Close_Value'] = df_relations['Allocated_Close_Vol'] * df_relations['Close_WAP']
+            total_open_vol = df_relations['Abs_Allocated_Vol'].sum()
+            total_close_vol = df_relations['Allocated_Close_Vol'].sum()
+            total_open_wap = (
+                (df_relations['Abs_Allocated_Vol'] * df_relations['Open_Price']).sum() / total_open_vol
+                if total_open_vol > 0 else 0
+            )
+            total_close_wap = (
+                df_relations['Close_Value'].sum() / total_close_vol
+                if total_close_vol > 0 else 0
+            )
+            self.df_overall_summary = pd.DataFrame([{
+                'Matched_Open_Vol': total_open_vol,
+                'Open_WAP': total_open_wap,
+                'Matched_Close_Vol': total_close_vol,
+                'Close_WAP': total_close_wap
+            }])
+            open_summary = df_relations.groupby('Cargo_ID').apply(
+                lambda grp: pd.Series({
+                    'Matched_Open_Vol': grp['Abs_Allocated_Vol'].sum(),
+                    'Open_WAP': (grp['Abs_Allocated_Vol'] * grp['Open_Price']).sum() / grp['Abs_Allocated_Vol'].sum()
+                    if grp['Abs_Allocated_Vol'].sum() > 0 else 0,
+                    'Matched_Close_Vol': grp['Allocated_Close_Vol'].sum(),
+                    'Close_WAP': grp['Close_Value'].sum() / grp['Allocated_Close_Vol'].sum()
+                    if grp['Allocated_Close_Vol'].sum() > 0 else 0
+                })
+            ).reset_index()
+            df_physical = df_physical.merge(open_summary, on='Cargo_ID', how='left')
+            df_physical['Post_1112_Open_Vol'] = df_physical['Matched_Open_Vol']
+            df_physical['Post_1112_Open_WAP'] = df_physical['Open_WAP']
+            df_physical['Post_1112_Close_Vol'] = df_physical['Matched_Close_Vol']
+            df_physical['Post_1112_Close_WAP'] = df_physical['Close_WAP']
+            self.df_cargo_summary = open_summary.copy()
+            self.df_cargo_summary['Post_1112_Open_Vol'] = self.df_cargo_summary['Matched_Open_Vol']
+            self.df_cargo_summary['Post_1112_Open_WAP'] = self.df_cargo_summary['Open_WAP']
+            self.df_cargo_summary['Post_1112_Close_Vol'] = self.df_cargo_summary['Matched_Close_Vol']
+            self.df_cargo_summary['Post_1112_Close_WAP'] = self.df_cargo_summary['Close_WAP']
+        else:
+            df_physical['Matched_Open_Vol'] = 0.0
+            df_physical['Open_WAP'] = 0.0
+            df_physical['Matched_Close_Vol'] = 0.0
+            df_physical['Close_WAP'] = 0.0
+            df_physical['Post_1112_Open_Vol'] = 0.0
+            df_physical['Post_1112_Open_WAP'] = 0.0
+            df_physical['Post_1112_Close_Vol'] = 0.0
+            df_physical['Post_1112_Close_WAP'] = 0.0
+            self.df_cargo_summary = pd.DataFrame(
+                columns=[
+                    'Cargo_ID',
+                    'Matched_Open_Vol',
+                    'Open_WAP',
+                    'Matched_Close_Vol',
+                    'Close_WAP',
+                    'Post_1112_Open_Vol',
+                    'Post_1112_Open_WAP',
+                    'Post_1112_Close_Vol',
+                    'Post_1112_Close_WAP'
+                ]
+            )
+            self.df_overall_summary = pd.DataFrame(
+                columns=[
+                    'Matched_Open_Vol',
+                    'Open_WAP',
+                    'Matched_Close_Vol',
+                    'Close_WAP'
+                ]
+            )
         st.success(f"✅ 实货匹配完成！共生成 {len(df_relations)} 条匹配记录")
         
         return df_relations, df_physical
@@ -833,7 +977,7 @@ def main():
                             
                             # 显示匹配过程数据
                             with st.expander("📊 匹配过程数据", expanded=False):
-                                tab1, tab2, tab3 = st.tabs(["纸货净仓", "实货更新", "匹配关系"])
+                                tab1, tab2, tab3, tab4, tab5 = st.tabs(["纸货净仓", "实货更新", "匹配关系", "实货汇总", "总体汇总"])
                                 
                                 with tab1:
                                     if df_paper_net is not None:
@@ -855,6 +999,25 @@ def main():
                                         st.caption(f"匹配关系数据 ({len(df_relations)}行)")
                                     else:
                                         st.info("无匹配关系数据")
+
+                                with tab4:
+                                    summary_df = st.session_state.engine.df_cargo_summary
+                                    if summary_df is not None and not summary_df.empty:
+                                        phy_2026 = summary_df[
+                                            summary_df['Cargo_ID'].astype(str).str.upper().str.startswith('PHY-2026')
+                                        ]
+                                        st.dataframe(phy_2026, use_container_width=True)
+                                        st.caption(f"实货汇总数据 ({len(phy_2026)}行)")
+                                    else:
+                                        st.info("无实货汇总数据")
+
+                                with tab5:
+                                    overall_df = st.session_state.engine.df_overall_summary
+                                    if overall_df is not None and not overall_df.empty:
+                                        st.dataframe(overall_df, use_container_width=True)
+                                        st.caption("所有匹配开仓/平仓加权均价汇总")
+                                    else:
+                                        st.info("无总体汇总数据")
                         else:
                             st.markdown('<div class="warning-box">⚠️ 匹配完成但未生成匹配记录，请检查数据格式和内容</div>', unsafe_allow_html=True)
                             
