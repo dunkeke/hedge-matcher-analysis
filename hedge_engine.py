@@ -203,9 +203,17 @@ def auto_match_hedges(physical_df, paper_df):
     active_paper['Allocated_To_Phy'] = 0.0
     active_paper['_original_index'] = active_paper.index
 
+    def filter_close_events(events, start_date):
+        if pd.isna(start_date):
+            return list(events or [])
+        return [
+            event for event in (events or [])
+            if pd.notna(event.get('Date')) and event.get('Date') >= start_date
+        ]
+
     close_event_pool = {}
     for _, ticket in active_paper.iterrows():
-        events = ticket.get('Close_Events', []) or []
+        events = filter_close_events(ticket.get('Close_Events', []), match_start_date)
         if events:
             sorted_events = sorted(
                 events,
@@ -286,7 +294,9 @@ def auto_match_hedges(physical_df, paper_df):
                 open_price = ticket.get('Price', 0)
                 mtm_price = ticket.get('Mtm Price', 0)
                 total_pl = ticket.get('Total P/L', 0)
-                close_path, _ = format_close_details(ticket.get('Close_Events', []))
+                close_path, _ = format_close_details(
+                    filter_close_events(ticket.get('Close_Events', []), match_start_date)
+                )
 
                 unrealized_mtm = (mtm_price - open_price) * alloc_amt
 
@@ -345,11 +355,19 @@ def auto_match_hedges(physical_df, paper_df):
             })
         ).reset_index()
         physical_df_sorted = physical_df_sorted.merge(open_summary, on='Cargo_ID', how='left')
+        physical_df_sorted['Post_1112_Open_Vol'] = physical_df_sorted['Matched_Open_Vol']
+        physical_df_sorted['Post_1112_Open_WAP'] = physical_df_sorted['Open_WAP']
+        physical_df_sorted['Post_1112_Close_Vol'] = physical_df_sorted['Matched_Close_Vol']
+        physical_df_sorted['Post_1112_Close_WAP'] = physical_df_sorted['Close_WAP']
     else:
         physical_df_sorted['Matched_Open_Vol'] = 0.0
         physical_df_sorted['Open_WAP'] = 0.0
         physical_df_sorted['Matched_Close_Vol'] = 0.0
         physical_df_sorted['Close_WAP'] = 0.0
+        physical_df_sorted['Post_1112_Open_Vol'] = 0.0
+        physical_df_sorted['Post_1112_Open_WAP'] = 0.0
+        physical_df_sorted['Post_1112_Close_Vol'] = 0.0
+        physical_df_sorted['Post_1112_Close_WAP'] = 0.0
 
     # --- 修复回写逻辑 ---
     if not active_paper.empty:

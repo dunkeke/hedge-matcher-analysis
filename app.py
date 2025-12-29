@@ -150,9 +150,17 @@ class HedgeMatchingEngine:
         active_paper['Allocated_To_Phy'] = 0.0
         active_paper['_original_index'] = active_paper.index
 
+        def filter_close_events(events, start_date):
+            if pd.isna(start_date):
+                return list(events or [])
+            return [
+                event for event in (events or [])
+                if pd.notna(event.get('Date')) and event.get('Date') >= start_date
+            ]
+
         close_event_pool = {}
         for _, ticket in active_paper.iterrows():
-            events = ticket.get('Close_Events', []) or []
+            events = filter_close_events(ticket.get('Close_Events', []), match_start_date)
             if events:
                 sorted_events = sorted(
                     events,
@@ -250,7 +258,10 @@ class HedgeMatchingEngine:
                     close_path_str = ""
                     if close_events:
                         try:
-                            sorted_events = sorted(close_events, key=lambda x: x['Date'] if pd.notna(x['Date']) else pd.Timestamp.min)
+                            sorted_events = sorted(
+                                filter_close_events(close_events, match_start_date),
+                                key=lambda x: x['Date'] if pd.notna(x['Date']) else pd.Timestamp.min
+                            )
                             details = []
                             for e in sorted_events:
                                 d_str = e['Date'].strftime('%Y-%m-%d') if pd.notna(e['Date']) else 'N/A'
@@ -329,11 +340,19 @@ class HedgeMatchingEngine:
                 })
             ).reset_index()
             df_physical = df_physical.merge(open_summary, on='Cargo_ID', how='left')
+            df_physical['Post_1112_Open_Vol'] = df_physical['Matched_Open_Vol']
+            df_physical['Post_1112_Open_WAP'] = df_physical['Open_WAP']
+            df_physical['Post_1112_Close_Vol'] = df_physical['Matched_Close_Vol']
+            df_physical['Post_1112_Close_WAP'] = df_physical['Close_WAP']
         else:
             df_physical['Matched_Open_Vol'] = 0.0
             df_physical['Open_WAP'] = 0.0
             df_physical['Matched_Close_Vol'] = 0.0
             df_physical['Close_WAP'] = 0.0
+            df_physical['Post_1112_Open_Vol'] = 0.0
+            df_physical['Post_1112_Open_WAP'] = 0.0
+            df_physical['Post_1112_Close_Vol'] = 0.0
+            df_physical['Post_1112_Close_WAP'] = 0.0
         st.success(f"✅ 实货匹配完成！共生成 {len(df_relations)} 条匹配记录")
         
         return df_relations, df_physical
