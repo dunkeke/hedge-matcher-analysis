@@ -191,7 +191,11 @@ def auto_match_hedges(physical_df, paper_df):
     default_match_start_date = pd.NaT
     trade_years = paper_df['Trade Date'].dropna().dt.year
     if not trade_years.empty:
-        default_match_start_date = pd.Timestamp(year=int(trade_years.max()), month=11, day=13)
+        default_match_start_date = pd.Timestamp(
+            year=int(trade_years.max()),
+            month=11,
+            day=13
+        ).normalize()
 
     # 强制初始化
     paper_df['Allocated_To_Phy'] = 0.0
@@ -251,17 +255,25 @@ def auto_match_hedges(physical_df, paper_df):
         proxy = str(cargo['Hedge_Proxy'])
         target_month = cargo.get('Target_Contract_Month', None)
         desig_date = cargo.get('Designation_Date', pd.NaT)
-        cargo_start_date = default_match_start_date
         if pd.notna(desig_date):
-            desig_start = desig_date.normalize()
-            if pd.isna(cargo_start_date) or desig_start > cargo_start_date:
-                cargo_start_date = desig_start
+            match_year = int(pd.to_datetime(desig_date).year)
+        else:
+            match_year = int(default_match_start_date.year) if pd.notna(default_match_start_date) else None
+        if match_year is not None:
+            cargo_start_date = pd.Timestamp(year=match_year, month=11, day=13).normalize()
+        else:
+            cargo_start_date = default_match_start_date
         benchmark = str(cargo.get('Pricing_Benchmark', '')).upper()
-        proxy_candidates = [proxy] if proxy else []
         if 'BRENT' in benchmark:
-            proxy_candidates = proxy_candidates or []
-            proxy_candidates.extend(['PHY-2026-001', 'PHY-2026-002', 'PHY-2026-003'])
-            proxy_candidates = list(dict.fromkeys(proxy_candidates))
+            proxy_candidates = [
+                'PHY-2026-004',
+                'PHY-2026-005',
+                'PHY-2026-001',
+                'PHY-2026-002',
+                'PHY-2026-003'
+            ]
+        else:
+            proxy_candidates = [proxy] if proxy else []
 
         for proxy_value in proxy_candidates:
             if abs(phy_vol) < 1:
@@ -329,11 +341,17 @@ def auto_match_hedges(physical_df, paper_df):
                         break
                     close_queue.popleft()
                 remaining = abs(alloc_amt)
+                close_event_details = []
                 while remaining > 0 and close_queue:
                     event = close_queue[0]
                     take = min(remaining, event['remaining'])
                     close_volume += take
                     close_price_total += take * event['price']
+                    close_event_details.append({
+                        'Date': event.get('date'),
+                        'Price': event.get('price', 0),
+                        'Vol': take
+                    })
                     event['remaining'] -= take
                     remaining -= take
                     if event['remaining'] < 0.0001:
@@ -353,7 +371,8 @@ def auto_match_hedges(physical_df, paper_df):
                     'Time_Lag': ticket.get('Time_Lag_Days'),
                     'Close_Path': close_path,
                     'Allocated_Close_Vol': close_volume,
-                    'Close_WAP': close_wap
+                    'Close_WAP': close_wap,
+                    'Close_Events': close_event_details
                 })
 
         physical_df_sorted.at[idx, 'Unhedged_Volume'] = phy_vol
