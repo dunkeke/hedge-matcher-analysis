@@ -191,13 +191,15 @@ def auto_match_hedges(physical_df, paper_df):
     default_match_start_date = pd.NaT
     trade_years = paper_df['Trade Date'].dropna().dt.year
     if not trade_years.empty:
-        default_match_start_date = pd.Timestamp(year=int(trade_years.max()), month=11, day=12)
+        default_match_start_date = pd.Timestamp(year=int(trade_years.max()), month=11, day=13)
 
     # 强制初始化
     paper_df['Allocated_To_Phy'] = 0.0
 
     # 索引构建
     active_paper = paper_df[paper_df['Net_Open_Vol'] > 0.0001].copy()
+    if pd.notna(default_match_start_date):
+        active_paper = active_paper[active_paper['Trade Date'] >= default_match_start_date]
     active_paper['Allocated_To_Phy'] = 0.0
     active_paper['_original_index'] = active_paper.index
 
@@ -229,12 +231,18 @@ def auto_match_hedges(physical_df, paper_df):
 
     # 实货排序
     physical_df['Sort_Date'] = physical_df['Designation_Date'].fillna(pd.Timestamp.max)
-    priority_cargos = {'PHY-2026-004', 'PHY-2026-005'}
+    priority_order = {
+        'PHY-2026-004': 0,
+        'PHY-2026-005': 1,
+        'PHY-2026-001': 2,
+        'PHY-2026-002': 3,
+        'PHY-2026-003': 4,
+    }
     physical_df['Benchmark_Priority'] = physical_df['Pricing_Benchmark'].astype(str).str.upper().str.contains('BRENT')
-    physical_df['Cargo_Priority'] = physical_df['Cargo_ID'].astype(str).str.upper().isin(priority_cargos)
+    physical_df['Cargo_Priority'] = physical_df['Cargo_ID'].astype(str).str.upper().map(priority_order).fillna(99)
     physical_df_sorted = physical_df.sort_values(
         by=['Benchmark_Priority', 'Cargo_Priority', 'Sort_Date', 'Cargo_ID'],
-        ascending=[False, False, True, True]
+        ascending=[False, True, True, True]
     )
 
     for idx, cargo in physical_df_sorted.iterrows():
@@ -243,15 +251,17 @@ def auto_match_hedges(physical_df, paper_df):
         proxy = str(cargo['Hedge_Proxy'])
         target_month = cargo.get('Target_Contract_Month', None)
         desig_date = cargo.get('Designation_Date', pd.NaT)
+        cargo_start_date = default_match_start_date
         if pd.notna(desig_date):
-            cargo_start_date = desig_date.normalize()
-        else:
-            cargo_start_date = default_match_start_date
+            desig_start = desig_date.normalize()
+            if pd.isna(cargo_start_date) or desig_start > cargo_start_date:
+                cargo_start_date = desig_start
         benchmark = str(cargo.get('Pricing_Benchmark', '')).upper()
         proxy_candidates = [proxy] if proxy else []
         if 'BRENT' in benchmark:
             proxy_candidates = proxy_candidates or []
             proxy_candidates.extend(['PHY-2026-001', 'PHY-2026-002', 'PHY-2026-003'])
+            proxy_candidates = list(dict.fromkeys(proxy_candidates))
 
         for proxy_value in proxy_candidates:
             if abs(phy_vol) < 1:
