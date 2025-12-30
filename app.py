@@ -29,6 +29,8 @@ class HedgeMatchingEngine:
         self.df_physical_updated = None
         self.df_cargo_summary = None
         self.df_overall_summary = None
+        self.df_open_month_summary = None
+        self.df_close_event_summary = None
         
     def clean_str(self, series):
         """清洗字符串"""
@@ -144,7 +146,11 @@ class HedgeMatchingEngine:
         default_match_start_date = pd.NaT
         trade_years = df_paper_net['Trade Date'].dropna().dt.year
         if not trade_years.empty:
-            default_match_start_date = pd.Timestamp(year=int(trade_years.max()), month=11, day=12)
+            default_match_start_date = pd.Timestamp(
+                year=int(trade_years.max()),
+                month=11,
+                day=13
+            ).normalize()
 
         active_paper = df_paper_net[df_paper_net['Net_Open_Vol'] > 0.0001].copy()
         active_paper['Allocated_To_Phy'] = 0.0
@@ -205,14 +211,24 @@ class HedgeMatchingEngine:
             target_month = cargo.get('Target_Contract_Month', None)
             desig_date = cargo.get('Designation_Date', pd.NaT)
             if pd.notna(desig_date):
-                cargo_start_date = pd.Timestamp(year=desig_date.year, month=11, day=12)
+                match_year = int(pd.to_datetime(desig_date).year)
+            else:
+                match_year = int(default_match_start_date.year) if pd.notna(default_match_start_date) else None
+            if match_year is not None:
+                cargo_start_date = pd.Timestamp(year=match_year, month=11, day=13).normalize()
             else:
                 cargo_start_date = default_match_start_date
             benchmark = str(cargo.get('Pricing_Benchmark', '')).upper()
-            proxy_candidates = [proxy] if proxy else []
             if 'BRENT' in benchmark:
-                proxy_candidates = proxy_candidates or []
-                proxy_candidates.extend(['PHY-2026-001', 'PHY-2026-002', 'PHY-2026-003'])
+                proxy_candidates = [
+                    'PHY-2026-004',
+                    'PHY-2026-005',
+                    'PHY-2026-001',
+                    'PHY-2026-002',
+                    'PHY-2026-003'
+                ]
+            else:
+                proxy_candidates = [proxy] if proxy else []
             
             for proxy_value in proxy_candidates:
                 if abs(phy_vol) < 1:
@@ -293,11 +309,17 @@ class HedgeMatchingEngine:
                             break
                         close_queue.popleft()
                     remaining = abs(alloc_amt)
+                    close_event_details = []
                     while remaining > 0 and close_queue:
                         event = close_queue[0]
                         take = min(remaining, event['remaining'])
                         close_volume += take
                         close_price_total += take * event['price']
+                        close_event_details.append({
+                            'Date': event.get('date'),
+                            'Price': event.get('price', 0),
+                            'Vol': take
+                        })
                         event['remaining'] -= take
                         remaining -= take
                         if event['remaining'] < 0.0001:
@@ -324,6 +346,7 @@ class HedgeMatchingEngine:
                         'Close_Path_Details': close_path_str,
                         'Allocated_Close_Vol': close_volume,
                         'Close_WAP': close_wap,
+                        'Close_Events': close_event_details,
                     })
 
                     # 更新实货未对冲量
@@ -378,6 +401,41 @@ class HedgeMatchingEngine:
             self.df_cargo_summary['Post_1112_Open_WAP'] = self.df_cargo_summary['Open_WAP']
             self.df_cargo_summary['Post_1112_Close_Vol'] = self.df_cargo_summary['Matched_Close_Vol']
             self.df_cargo_summary['Post_1112_Close_WAP'] = self.df_cargo_summary['Close_WAP']
+            open_month_summary = df_relations.groupby(['Cargo_ID', 'Month']).apply(
+                lambda grp: pd.Series({
+                    'Matched_Open_Vol': grp['Abs_Allocated_Vol'].sum(),
+                    'Open_WAP': (grp['Abs_Allocated_Vol'] * grp['Open_Price']).sum() / grp['Abs_Allocated_Vol'].sum()
+                    if grp['Abs_Allocated_Vol'].sum() > 0 else 0
+                })
+            ).reset_index()
+            self.df_open_month_summary = open_month_summary
+
+            close_event_rows = []
+            for _, row in df_relations.iterrows():
+                events = row.get('Close_Events', []) or []
+                for event in events:
+                    close_event_rows.append({
+                        'Cargo_ID': row.get('Cargo_ID'),
+                        'Month': row.get('Month'),
+                        'Close_Date': event.get('Date'),
+                        'Close_Vol': event.get('Vol', 0),
+                        'Close_Price': event.get('Price', 0)
+                    })
+            close_events_df = pd.DataFrame(close_event_rows)
+            if not close_events_df.empty:
+                close_events_df['Close_Value'] = close_events_df['Close_Vol'] * close_events_df['Close_Price']
+                close_summary = close_events_df.groupby(['Cargo_ID', 'Close_Date']).apply(
+                    lambda grp: pd.Series({
+                        'Close_Vol': grp['Close_Vol'].sum(),
+                        'Close_WAP': grp['Close_Value'].sum() / grp['Close_Vol'].sum()
+                        if grp['Close_Vol'].sum() > 0 else 0
+                    })
+                ).reset_index().sort_values(by=['Close_Date', 'Cargo_ID'])
+                self.df_close_event_summary = close_summary
+            else:
+                self.df_close_event_summary = pd.DataFrame(
+                    columns=['Cargo_ID', 'Close_Date', 'Close_Vol', 'Close_WAP']
+                )
         else:
             df_physical['Matched_Open_Vol'] = 0.0
             df_physical['Open_WAP'] = 0.0
@@ -399,6 +457,12 @@ class HedgeMatchingEngine:
                     'Post_1112_Close_Vol',
                     'Post_1112_Close_WAP'
                 ]
+            )
+            self.df_open_month_summary = pd.DataFrame(
+                columns=['Cargo_ID', 'Month', 'Matched_Open_Vol', 'Open_WAP']
+            )
+            self.df_close_event_summary = pd.DataFrame(
+                columns=['Cargo_ID', 'Close_Date', 'Close_Vol', 'Close_WAP']
             )
             self.df_overall_summary = pd.DataFrame(
                 columns=[
@@ -977,7 +1041,15 @@ def main():
                             
                             # 显示匹配过程数据
                             with st.expander("📊 匹配过程数据", expanded=False):
-                                tab1, tab2, tab3, tab4, tab5 = st.tabs(["纸货净仓", "实货更新", "匹配关系", "实货汇总", "总体汇总"])
+                                tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+                                    "纸货净仓",
+                                    "实货更新",
+                                    "匹配关系",
+                                    "实货汇总",
+                                    "总体汇总",
+                                    "月度开仓汇总",
+                                    "平仓时间汇总"
+                                ])
                                 
                                 with tab1:
                                     if df_paper_net is not None:
@@ -1018,6 +1090,22 @@ def main():
                                         st.caption("所有匹配开仓/平仓加权均价汇总")
                                     else:
                                         st.info("无总体汇总数据")
+
+                                with tab6:
+                                    month_summary_df = st.session_state.engine.df_open_month_summary
+                                    if month_summary_df is not None and not month_summary_df.empty:
+                                        st.dataframe(month_summary_df, use_container_width=True)
+                                        st.caption("匹配开仓量按合约月份加权均价汇总")
+                                    else:
+                                        st.info("无月度开仓汇总数据")
+
+                                with tab7:
+                                    close_summary_df = st.session_state.engine.df_close_event_summary
+                                    if close_summary_df is not None and not close_summary_df.empty:
+                                        st.dataframe(close_summary_df, use_container_width=True)
+                                        st.caption("按时间顺序的平仓加权均价汇总")
+                                    else:
+                                        st.info("无平仓时间汇总数据")
                         else:
                             st.markdown('<div class="warning-box">⚠️ 匹配完成但未生成匹配记录，请检查数据格式和内容</div>', unsafe_allow_html=True)
                             
