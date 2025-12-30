@@ -202,6 +202,8 @@ def auto_match_hedges(physical_df, paper_df):
 
     # 索引构建
     active_paper = paper_df[paper_df['Net_Open_Vol'] > 0.0001].copy()
+    if pd.notna(default_match_start_date):
+        active_paper = active_paper[active_paper['Trade Date'] >= default_match_start_date]
     active_paper['Allocated_To_Phy'] = 0.0
     active_paper['_original_index'] = active_paper.index
 
@@ -233,12 +235,18 @@ def auto_match_hedges(physical_df, paper_df):
 
     # 实货排序
     physical_df['Sort_Date'] = physical_df['Designation_Date'].fillna(pd.Timestamp.max)
-    priority_cargos = {'PHY-2026-004', 'PHY-2026-005'}
+    priority_order = {
+        'PHY-2026-004': 0,
+        'PHY-2026-005': 1,
+        'PHY-2026-001': 2,
+        'PHY-2026-002': 3,
+        'PHY-2026-003': 4,
+    }
     physical_df['Benchmark_Priority'] = physical_df['Pricing_Benchmark'].astype(str).str.upper().str.contains('BRENT')
-    physical_df['Cargo_Priority'] = physical_df['Cargo_ID'].astype(str).str.upper().isin(priority_cargos)
+    physical_df['Cargo_Priority'] = physical_df['Cargo_ID'].astype(str).str.upper().map(priority_order).fillna(99)
     physical_df_sorted = physical_df.sort_values(
         by=['Benchmark_Priority', 'Cargo_Priority', 'Sort_Date', 'Cargo_ID'],
-        ascending=[False, False, True, True]
+        ascending=[False, True, True, True]
     )
 
     for idx, cargo in physical_df_sorted.iterrows():

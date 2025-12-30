@@ -153,6 +153,8 @@ class HedgeMatchingEngine:
             ).normalize()
 
         active_paper = df_paper_net[df_paper_net['Net_Open_Vol'] > 0.0001].copy()
+        if pd.notna(default_match_start_date):
+            active_paper = active_paper[active_paper['Trade Date'] >= default_match_start_date]
         active_paper['Allocated_To_Phy'] = 0.0
         active_paper['_original_index'] = active_paper.index
 
@@ -186,15 +188,21 @@ class HedgeMatchingEngine:
         df_phy['_orig_idx'] = df_phy.index
         
         # BRENT优先匹配 + 指定货物优先级
-        priority_cargos = {'PHY-2026-004', 'PHY-2026-005'}
+        priority_order = {
+            'PHY-2026-004': 0,
+            'PHY-2026-005': 1,
+            'PHY-2026-001': 2,
+            'PHY-2026-002': 3,
+            'PHY-2026-003': 4,
+        }
         if 'Pricing_Benchmark' in df_phy.columns:
             df_phy['_bench_priority'] = df_phy['Pricing_Benchmark'].astype(str).str.upper().str.contains('BRENT')
         else:
             df_phy['_bench_priority'] = False
-        df_phy['_cargo_priority'] = df_phy['Cargo_ID'].astype(str).str.upper().isin(priority_cargos)
+        df_phy['_cargo_priority'] = df_phy['Cargo_ID'].astype(str).str.upper().map(priority_order).fillna(99)
         df_phy = df_phy.sort_values(
             by=['_bench_priority', '_cargo_priority', '_orig_idx'],
-            ascending=[False, False, True]
+            ascending=[False, True, True]
         ).reset_index(drop=True)
         df_phy = df_phy.drop(columns=['_bench_priority', '_cargo_priority'])
         
@@ -368,7 +376,7 @@ class HedgeMatchingEngine:
             total_open_vol = df_relations['Abs_Allocated_Vol'].sum()
             total_close_vol = df_relations['Allocated_Close_Vol'].sum()
             total_open_wap = (
-                (df_relations['Abs_Allocated_Vol'] * df_relations['Open_Price']).sum() / total_open_vol
+                df_relations['Open_Value'].sum() / total_open_vol
                 if total_open_vol > 0 else 0
             )
             total_close_wap = (
@@ -384,7 +392,7 @@ class HedgeMatchingEngine:
             open_summary = df_relations.groupby('Cargo_ID').apply(
                 lambda grp: pd.Series({
                     'Matched_Open_Vol': grp['Abs_Allocated_Vol'].sum(),
-                    'Open_WAP': (grp['Abs_Allocated_Vol'] * grp['Open_Price']).sum() / grp['Abs_Allocated_Vol'].sum()
+                    'Open_WAP': grp['Open_Value'].sum() / grp['Abs_Allocated_Vol'].sum()
                     if grp['Abs_Allocated_Vol'].sum() > 0 else 0,
                     'Matched_Close_Vol': grp['Allocated_Close_Vol'].sum(),
                     'Close_WAP': grp['Close_Value'].sum() / grp['Allocated_Close_Vol'].sum()
